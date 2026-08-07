@@ -283,8 +283,21 @@ public:
         UNRECOGNIZED_OPCODE,
     };
 
+    /*
+     * `impl` MUST be initialised here.  It is a raw pointer that toInt() below
+     * dereferences whenever it is non-null, so leaving it indeterminate makes
+     * toInt() read a wild address.  This constructor is the one MessageDecoder
+     * uses -- FeatureAbort(const CECFrame&, int) builds its `reason` member from
+     * an int -- so a single directed <Feature Abort> frame injected by any test
+     * used to segfault the whole WPEFramework host inside
+     * HdmiCecSinkProcessor::process(const FeatureAbort&, const Header&).
+     * (Broadcast aborts returned early and the registered-source arm was guarded
+     * by a short-circuit, which is why the crash stayed hidden until an L2 test
+     * finally injected a directed abort from a registered logical address.)
+     */
     AbortReason(int reason)
-        : CECBytes((uint8_t)reason){
+        : CECBytes((uint8_t)reason)
+        , impl(nullptr){
     }
 
     AbortReason();
@@ -396,12 +409,29 @@ public:
     };
     PhysicalAddress(const CECFrame& frame, size_t startPos)
         : CECBytes(frame, startPos, MAX_LEN){};
+    /*
+     * A CEC physical address is four digits (a.b.c.d) packed as nibbles into
+     * MAX_LEN == 2 bytes: byte 0 holds a:b and byte 1 holds c:d.  That is what
+     * ccec's PhysicalAddress does (hdmicec/ccec/include/ccec/Operands.hpp) and it
+     * is the representation every frame on the wire uses, so it is also what
+     * PhysicalAddress(const CECFrame&, size_t) above produces.
+     *
+     * This constructor used to push the four digits as four SEPARATE bytes, which
+     * left the class with two mutually incomparable internal representations: a
+     * frame-parsed address was two packed bytes while a digit-constructed one was
+     * four unpacked bytes.  operator== compares the byte vectors, so an address
+     * built from digits could never equal the same address parsed from a frame.
+     * HdmiCecSinkImplementation::HdmiPortMap builds its own m_physicalAddr from
+     * digits (portID + 1, 0, 0, 0) and relies on exactly that comparison in
+     * addChild() to learn its own logical address; because the comparison could
+     * never hold, m_logicalAddr stayed UNREGISTERED for ever and addChild(),
+     * removeChild() and getRoute() -- all three guarded on it -- were dead code
+     * that no test at any level could reach through the production frame path.
+     */
     PhysicalAddress(uint8_t byte0, uint8_t byte1, uint8_t byte2, uint8_t byte3)
         : CECBytes(NULL, 0) {
-        str.push_back(byte0);
-        str.push_back(byte1);
-        str.push_back(byte2);
-        str.push_back(byte3);
+        str.push_back(static_cast<uint8_t>(((byte0 & 0x0F) << 4) | (byte1 & 0x0F)));
+        str.push_back(static_cast<uint8_t>(((byte2 & 0x0F) << 4) | (byte3 & 0x0F)));
     }
     explicit PhysicalAddress(uint16_t addr)
         : CECBytes(NULL, 0) {
@@ -418,9 +448,50 @@ public:
         return instance;
     }
 
+    /*
+     * Returns digit `index` of a.b.c.d, unpacked from the two packed bytes, which
+     * is the contract ccec's PhysicalAddress::getByteValue() offers and the one
+     * the sink plugin depends on: updateDeviceChain() matches
+     * getByteValue(0) == portID + 1 (so digit 0 must be 1, 2 or 3) and
+     * HdmiPortMap walks digits 1..3 to place a device in the port's device chain.
+     * Out-of-range indices and short/empty buffers yield 0 rather than throwing,
+     * matching the previous bounds-checked behaviour.
+     */
     uint8_t getByteValue(int index) const
     {
-        return (index >= 0 && static_cast<size_t>(index) < str.size()) ? str[index] : 0;
+        if (index < 0 || index > 3) {
+            return 0;
+        }
+        const size_t byteIndex = static_cast<size_t>(index) / 2;
+        if (byteIndex >= str.size()) {
+            return 0;
+        }
+        return (index % 2 == 0) ? static_cast<uint8_t>((str[byteIndex] & 0xF0) >> 4)
+                                : static_cast<uint8_t>(str[byteIndex] & 0x0F);
+    }
+
+    /*
+     * Renders the address as its four digits in hex with no separator -- "2000"
+     * for 2.0.0.0, "ffff" for 15.15.15.15.  That is byte-for-byte what the
+     * inherited CECBytes::toString() produced while this class stored four
+     * unpacked bytes, so the packing change above stays invisible to callers and
+     * to the assertions that already pin these strings (for example
+     * entservices-hdmicecsink/Tests/L1Tests/tests/test_HdmiCecSink.cpp expects
+     * "2000" and "ffff").  ccec's real toString() uses the dotted form; adopting
+     * it here is a separate, wider change that no coverage gap requires, so it is
+     * deliberately not made.  An address with fewer than MAX_LEN bytes -- what the
+     * std::string constructor above still yields -- renders empty, as before.
+     */
+    const std::string toString(void) const override
+    {
+        if (str.size() < MAX_LEN) {
+            return std::string();
+        }
+        std::stringstream stream;
+        for (int digit = 0; digit < 4; digit++) {
+            stream << std::hex << static_cast<int>(getByteValue(digit));
+        }
+        return stream.str();
     }
 };
 
@@ -1064,7 +1135,24 @@ public:
         , deviceType(devType){
     }
 
-    ReportPhysicalAddress(const CECFrame& frame, int startPos = 0)
+    /*
+     * The operand area of a CEC frame starts at byte 2 -- byte 0 is the header
+     * (source/destination nibbles) and byte 1 is the opcode.  MessageDecoder
+     * hands this constructor the WHOLE frame and relies on the default argument,
+     * so a default of 0 made every inbound <Report Physical Address> parse its
+     * physical address out of {header, opcode} and its device type out of the
+     * first real address byte.  40 of the 42 frame-parsing constructors in this
+     * header already default to 2; this one and SetStreamPath did not.
+     *
+     * Concretely, for `4F 84 10 00 04` the physical address came out as
+     * {0x4F, 0x84} instead of {0x10, 0x00}.  Because
+     * HdmiCecSinkImplementation::updateDeviceChain() matches
+     * `phy_addr.getByteValue(0) == portID + 1` (so byte 0 must be 1, 2 or 3) and
+     * a header byte for a broadcast is always (source << 4) | 0x0F >= 15,
+     * HdmiPortMap::addChild()/getRoute()/removeChild() could never be reached and
+     * getActiveRoute() could only ever take its "not in correct state" arm.
+     */
+    ReportPhysicalAddress(const CECFrame& frame, int startPos = 2)
         : physicalAddress(frame, startPos)
         , deviceType(frame, startPos + PhysicalAddress::MAX_LEN){
     }
